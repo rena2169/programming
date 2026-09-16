@@ -1,0 +1,198 @@
+"""
+1.	Пагинация через li.next > a. Функция get_next_page ищет на странице ссылку «Next» и через urljoin строит из относительного href абсолютный URL. 
+Цикл while current_url идёт по страницам, пока такая ссылка есть. Флаг --max-pages ограничивает обход — важно, когда не хочешь случайно спарсить тысячи страниц и не быть забаненным.
+2.	Вежливость к серверу. Это не мелочь, а часть технической культуры:
+o	time.sleep(REQUEST_DELAY) — пауза 1 секунда между запросами.
+o	Один requests.Session() на весь обход — переиспользует TCP-соединение вместо того, чтобы каждый раз поднимать новое.
+o	Честный User-Agent с указанием назначения.
+o	Экспоненциальная задержка перед ретраем (REQUEST_DELAY * attempt) — при повторной попытке ждём дольше, не долбим сервер.
+3.	Обработка ошибок на всех уровнях.
+o	HTTP-ошибки (4xx/5xx) — не ретраим, это бессмысленно: если сервер сказал 404, второй раз он скажет то же самое.
+o	Сетевые ошибки (таймауты, обрывы) — до 3 попыток с нарастающей задержкой.
+o	Битая разметка внутри блока (if not (text_el and author_el)) — continue, скрипт не падает из-за одной кривой цитаты.
+o	KeyboardInterrupt в main() — Ctrl+C завершает работу корректно, а не стектрейсом.
+o	logging.exception при неожиданной ошибке — пишет полный traceback в лог, это invaluable при отладке.
+4.	Очистка «грязных» данных. clean_text убирает неразрывные пробелы (\xa0), типографские кавычки-ёлочки (“ ” ‘ ’) и обрезает пробелы по краям. 
+Именно такие символы чаще всего ломают CSV: неразрывный пробел выглядит как обычный, но Excel и pandas его не распознают, и данные «съезжают».
+5.	Структурирование через @dataclass. Quote — явная схема записи вместо россыпи словарей. Через asdict() она одной строкой превращается в словарь для csv.DictWriter. 
+Плюс: fieldnames берётся из первой записи, так что добавить новое поле достаточно в одном месте — в определении класса.
+6.	Логирование в файл и в консоль одновременно. Прогресс виден в реальном времени (StreamHandler), а полный лог остаётся в parser.log для разбора постфактум. 
+encoding='utf-8' у FileHandler — обязателен на Windows, иначе русские символы в логе превратятся в кракозябры.
+Примеры запуска
+# Обойти все страницы (для учебного сайта это ~10 страниц)
+python lab_4.py
+# Только первые 3 страницы, сохранить в другой файл
+python lab_4.py --max-pages 3 --output quotes_top3.csv
+# Проверить логику на одной странице
+python lab_4.py --max-pages 1
+# Указать другой стартовый URL (например, раздел по тегу)
+python lab_4.py --start-url https://quotes.toscrape.com/tag/love/page/1/
+"""
+
+import argparse
+import csv
+import logging
+import time
+from dataclasses import dataclass, asdict
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+
+# --- Настройка логирования ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("parser.log", encoding='utf-8'),
+        logging.StreamHandler(),
+    ],
+)
+
+# --- Константы ---
+BASE_URL = "https://quotes.toscrape.com"
+START_URL = f"{BASE_URL}/page/1/"
+HEADERS = {
+    "User-Agent": "EducationalParser/1.0 (+https://example.com/about; educational use)"
+}
+logging.info("Парсер запущен в учебных целях, соблюдаю вежливый rate limit.")
+REQUEST_DELAY = 1.0   # секунды между запросами
+TIMEOUT = 10          # секунды на ответ
+MAX_RETRIES = 3
+
+
+@dataclass
+class Quote:
+    """Структура одной записи. dataclass удобно конвертируется в dict."""
+    text: str
+    author: str
+    tags: str
+    url: str
+
+
+def fetch_page(url: str, session: requests.Session) -> BeautifulSoup | None:
+    """Скачивает страницу с ретраями и возвращает BeautifulSoup, либо None."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = session.get(url, headers=HEADERS, timeout=TIMEOUT)
+            response.raise_for_status()
+            return BeautifulSoup(response.text, "html.parser")
+        except requests.HTTPError as e:
+            # 404/403 и прочие HTTP-ошибки — не ретраим, только логируем
+            logging.error(f"HTTP-ошибка на {url}: {e}")
+            return None
+        except requests.RequestException as e:
+            logging.warning(f"Попытка {attempt}/{MAX_RETRIES} провалилась для {url}: {e}")
+            if attempt < MAX_RETRIES:
+                time.sleep(REQUEST_DELAY * attempt)  # экспоненциальная задержка
+    logging.error(f"Не удалось скачать {url} после {MAX_RETRIES} попыток")
+    return None
+
+
+def parse_quotes(soup: BeautifulSoup, page_url: str) -> list[Quote]:
+    """Извлекает цитаты со страницы. Возвращает список Quote."""
+    quotes = []
+    for block in soup.select("div.quote"):
+        text_el = block.select_one("span.text")
+        author_el = block.select_one("small.author")
+        tag_els = block.select("div.tags a.tag")
+
+        if not (text_el and author_el):
+            continue  # битая разметка — пропускаем
+
+        quotes.append(Quote(
+            text=clean_text(text_el.get_text()),
+            author=clean_text(author_el.get_text()),
+            tags=", ".join(clean_text(t.get_text()) for t in tag_els),
+            url=page_url,
+        ))
+    return quotes
+
+
+def clean_text(raw: str) -> str:
+    """Убирает лишние пробелы, кавычки-ёлочки и неразрывные пробелы."""
+    if not raw:
+        return ""
+    return (
+        raw.replace("\u201c", "").replace("\u201d", "")   # “ ”
+           .replace("\u2018", "").replace("\u2019", "")   # ‘ ’
+           .replace("\xa0", " ")                          # неразрывный пробел
+           .strip()
+    )
+
+
+def get_next_page(soup: BeautifulSoup, current_url: str) -> str | None:
+    """Возвращает абсолютный URL следующей страницы или None, если её нет."""
+    next_li = soup.select_one("li.next > a")
+    if not next_li or not next_li.get("href"):
+        return None
+    return urljoin(current_url, next_li["href"])
+
+
+def crawl(start_url: str, max_pages: int | None = None) -> list[Quote]:
+    """Обходит пагинацию и собирает цитаты со всех страниц."""
+    all_quotes: list[Quote] = []
+    current_url = start_url
+    page_num = 0
+
+    # Одна сессия на весь обход — переиспользует TCP-соединение, это вежливее
+    with requests.Session() as session:
+        while current_url:
+            page_num += 1
+            if max_pages and page_num > max_pages:
+                logging.info(f"Достигнут лимит страниц ({max_pages}). Останавливаюсь.")
+                break
+
+            logging.info(f"Страница {page_num}: {current_url}")
+            soup = fetch_page(current_url, session)
+            if soup is None:
+                break
+
+            page_quotes = parse_quotes(soup, current_url)
+            logging.info(f"  Найдено записей: {len(page_quotes)}")
+            all_quotes.extend(page_quotes)
+
+            current_url = get_next_page(soup, current_url)
+            if current_url:
+                time.sleep(REQUEST_DELAY)
+
+    return all_quotes
+
+
+def save_to_csv(items: list[Quote], path: str) -> None:
+    if not items:
+        logging.warning("Нечего сохранять — список пуст.")
+        return
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(asdict(items[0]).keys()))
+        writer.writeheader()
+        writer.writerows(asdict(item) for item in items)
+    logging.info(f"Сохранено {len(items)} записей в {path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Учебный веб-скрейпер цитат с quotes.toscrape.com"
+    )
+    parser.add_argument("--start-url", default=START_URL,
+                        help="Стартовый URL (по умолчанию — первая страница quotes.toscrape.com)")
+    parser.add_argument("--max-pages", type=int, default=None,
+                        help="Сколько страниц максимум обойти (по умолчанию — все)")
+    parser.add_argument("--output", default="quotes.csv",
+                        help="Путь к CSV-файлу (по умолчанию quotes.csv)")
+    args = parser.parse_args()
+
+    try:
+        quotes = crawl(args.start_url, args.max_pages)
+    except KeyboardInterrupt:
+        logging.warning("Прервано пользователем.")
+        return
+    except Exception as e:
+        logging.exception(f"Неожиданная ошибка: {e}")
+        return
+
+    save_to_csv(quotes, args.output)
+
+
+if __name__ == "__main__":
+    main()
